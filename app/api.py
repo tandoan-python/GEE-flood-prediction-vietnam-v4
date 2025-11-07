@@ -3,6 +3,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import joblib
 import ee
+import threading
+import time
 import os
 import pandas as pd
 import datetime
@@ -39,9 +41,22 @@ except FileNotFoundError:
 
 # Day la thu tu dac trung ma model da hoc (rat quan trong)
 FEATURES_ORDER = [
-    'aspect', 'elevation', 'land_cover', 'precip_14_day', 'precip_3_day', 
-    'precip_7_day', 'precip_total', 'slope', 'soil_moisture', 'soil_type'
+    # Đặc trưng địa hình
+    'elevation', 'slope', 'aspect',
+    # Đặc trưng lớp phủ và đất
+    'land_cover', 'soil_type',
+    # Flags từ land_cover
+    'is_flood_prone', 'is_permanent_water', 'is_urban', 'is_agriculture',
+    # Đặc trưng động
+    'precip_total', 'precip_14_day', 'precip_7_day', 'precip_3_day',
+    'soil_moisture'
 ]
+
+# Simple in-memory TTL cache for GEE point queries to reduce latency
+GEE_CACHE = {}
+GEE_CACHE_LOCK = threading.Lock()
+GEE_CACHE_TTL = 300  # seconds
+
 
 # =============================================================================
 # ĐỊNH NGHĨA MODEL INPUT
@@ -54,66 +69,73 @@ class PointData(BaseModel):
 # CÁC HÀM LOGIC GEE (Lay du lieu qua khu)
 # =============================================================================
 def get_gee_features_at_point(lat, lon):
+    """Get GEE-derived features at a point with simple in-memory caching.
+
+    Caches results for `GEE_CACHE_TTL` seconds keyed by rounded lat/lon to
+    avoid frequent Earth Engine round-trips for nearby clicks.
+    """
+    # Coarse rounding to reuse nearby queries
+    key = f"{round(lat,4)}_{round(lon,4)}"
+    now_ts = time.time()
+
+    with GEE_CACHE_LOCK:
+        entry = GEE_CACHE.get(key)
+        if entry:
+            ts, data = entry
+            if now_ts - ts < GEE_CACHE_TTL:
+                # return a copy to avoid accidental mutation
+                return dict(data)
+
     point = ee.Geometry.Point(lon, lat)
-    today = ee.Date(datetime.datetime.utcnow())
-    
-    # --- 1. DAC TRUNG TINH ---
+    today = ee.Date(datetime.datetime.now(datetime.timezone.utc))
+
+    # --- 1. Static features ---
     dem = ee.Image("USGS/SRTMGL1_003")
     slope = ee.Terrain.slope(dem).rename('slope')
     aspect = ee.Terrain.aspect(dem).rename('aspect')
     land_cover = ee.ImageCollection("ESA/WorldCover/v100").first().select('Map').rename('land_cover')
     soil = ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02").select('b0').rename('soil_type')
 
+    is_flood_prone = land_cover.eq(40).Or(land_cover.eq(50)).Or(land_cover.eq(90)).rename('is_flood_prone')
+    is_permanent_water = land_cover.eq(80).rename('is_permanent_water')
+    is_urban = land_cover.eq(50).rename('is_urban')
+    is_agriculture = land_cover.eq(40).rename('is_agriculture')
+
     static_features_image = dem.rename('elevation').addBands([
-        slope, aspect, land_cover.toByte(), soil.toByte()
+        slope, aspect, land_cover.toByte(), soil.toByte(),
+        is_flood_prone.toByte(), is_permanent_water.toByte(), is_urban.toByte(), is_agriculture.toByte()
     ])
-    
-    # --- 2. DAC TRUNG DONG (QUA KHU - ANTECEDENT) ---
-    end_date = today.advance(-3, 'day') 
-    
+
+    # --- 2. Antecedent / dynamic features ---
+    end_date = today.advance(-3, 'day')
+
     pre_start_date_14 = end_date.advance(-14, 'day')
-    precip_14_day = ee.ImageCollection("NASA/GPM_L3/IMERG_V07") \
-                      .filterDate(pre_start_date_14, end_date) \
-                      .select('precipitation').sum().rename('precip_14_day')
+    precip_14_day = ee.ImageCollection("NASA/GPM_L3/IMERG_V07").filterDate(pre_start_date_14, end_date).select('precipitation').sum().rename('precip_14_day')
 
     pre_start_date_7 = end_date.advance(-7, 'day')
-    precip_7_day = ee.ImageCollection("NASA/GPM_L3/IMERG_V07") \
-                     .filterDate(pre_start_date_7, end_date) \
-                     .select('precipitation').sum().rename('precip_7_day')
-    
+    precip_7_day = ee.ImageCollection("NASA/GPM_L3/IMERG_V07").filterDate(pre_start_date_7, end_date).select('precipitation').sum().rename('precip_7_day')
+
     pre_start_date_3 = end_date.advance(-3, 'day')
-    precip_3_day = ee.ImageCollection("NASA/GPM_L3/IMERG_V07") \
-                     .filterDate(pre_start_date_3, end_date) \
-                     .select('precipitation').sum().rename('precip_3_day')
+    precip_3_day = ee.ImageCollection("NASA/GPM_L3/IMERG_V07").filterDate(pre_start_date_3, end_date).select('precipitation').sum().rename('precip_3_day')
 
     pre_start_date_3_sm = end_date.advance(-3, 'day')
-    sm_collection = ee.ImageCollection("NASA/SMAP/SPL3SMP_E/005") \
-                        .filterDate(pre_start_date_3_sm, end_date) \
-                        .select('soil_moisture_am') 
-    
+    sm_collection = ee.ImageCollection("NASA/SMAP/SPL3SMP_E/005").filterDate(pre_start_date_3_sm, end_date).select('soil_moisture_am')
+
     collection_size = sm_collection.size()
     mean_sm_with_data = sm_collection.mean().unmask(0).rename('soil_moisture')
     mean_sm_empty = ee.Image(0).rename('soil_moisture')
-    soil_moisture_mean = ee.Image(
-        ee.Algorithms.If(collection_size.gt(0), mean_sm_with_data, mean_sm_empty)
-    )
+    soil_moisture_mean = ee.Image(ee.Algorithms.If(collection_size.gt(0), mean_sm_with_data, mean_sm_empty))
 
-    dynamic_features = precip_14_day.addBands([
-        precip_7_day,
-        precip_3_day,
-        soil_moisture_mean,
-        ee.Image(0).rename('precip_total') # Dat precip_total = 0 cho du doan 'hien tai'
-    ])
+    dynamic_features = precip_14_day.addBands([precip_7_day, precip_3_day, soil_moisture_mean, ee.Image(0).rename('precip_total')])
 
-    # --- 3. GOP TAT CA & LAY DU LIEU ---
+    # --- 3. Merge and fetch ---
     all_features_image = static_features_image.addBands(dynamic_features)
-    
-    data_dict = all_features_image.reduceRegion(
-        reducer=ee.Reducer.first(),
-        geometry=point,
-        scale=90
-    ).getInfo()
-    
+    data_dict = all_features_image.reduceRegion(reducer=ee.Reducer.first(), geometry=point, scale=90).getInfo()
+
+    # Cache and return
+    with GEE_CACHE_LOCK:
+        GEE_CACHE[key] = (now_ts, dict(data_dict))
+
     return data_dict
 
 # =============================================================================
@@ -136,96 +158,80 @@ def predict_flood(point_data: PointData):
         scaled_features = scaler.transform(df)
         probability = model.predict_proba(scaled_features)[0][1]
         
-        return {"probability": float(probability)}
+        # Trả về cả đặc trưng gốc để hiển thị
+        features_dict = {}
+        for col in df.columns:
+            features_dict[col] = float(df[col].iloc[0])
+        
+        return {
+            "probability": float(probability),
+            "features": features_dict
+        }
 
     except ee.ee_exception.EEException as e:
         raise HTTPException(status_code=500, detail=f"Loi GEE: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Loi server: {e}")
 
-# =============================================================================
-# ENDPOINT 2: DU BAO MUA 14 NGAY (CHO BIEU DO)
-# =============================================================================
-def get_gfs_forecast_at_point(lat, lon):
-    """
-    Lay du lieu DU BAO (forecast) 16 ngay tu GFS.
-    *** LOGIC MOI (Dut diem): Tim ban tin (run) moi nhat ***
-    """
-    point = ee.Geometry.Point(lon, lat)
-    
-    # === PHAN SUA LOI LOGIC DUT DIEM ===
-    # 1. Tim thoi gian bat dau 'system:time_start' cua BAN TIN MOI NHAT
-    try:
-        # Lay toan bo collection, sap xep va lay ban tin moi nhat
-        # .first() se la ban tin moi nhat vi GFS luon cap nhat
-        latest_run = ee.ImageCollection("NOAA/GFS0P25") \
-                        .sort('system:time_start', False) \
-                        .first()
-        
-        # Kiem tra xem co tim thay ban tin nao khong
-        if latest_run is None:
-             raise HTTPException(status_code=404, detail="Khong tim thay ban tin GFS moi nhat (null).")
-
-        # Lay thoi gian bat dau cua ban tin do
-        latest_run_time = latest_run.get('system:time_start')
-        
-        if latest_run_time is None:
-            # Loi nay gan nhu khong the xay ra neu latest_run ton tai
-            raise HTTPException(status_code=404, detail="Khong tim thay ban tin GFS moi nhat (time is null).")
-
-    except ee.ee_exception.EEException as e:
-         # Loi nay xay ra neu GEE khong the thuc hien .first() hoac .get()
-         raise HTTPException(status_code=500, detail=f"Loi GEE khi tim ban tin GFS: {e}")
-    except Exception as e:
-         raise HTTPException(status_code=404, detail=f"Loi server khi tim ban tin GFS: {e}")
-
-    # 2. Lay TAT CA cac hinh anh du bao thuoc ve ban tin (run) do
-    # Mot ban tin GFS day du keo dai 16 ngay (384 gio)
-    full_forecast_collection = ee.ImageCollection("NOAA/GFS0P25") \
-                                .filterMetadata('system:time_start', 'equals', latest_run_time) \
-                                .select('precipitation_rate')
-    
-    # === KET THUC SUA LOI LOGIC ===
-
-    def get_value_at_point(image):
-        precip = image.reduceRegion(
-            reducer=ee.Reducer.first(),
-            geometry=point,
-            scale=27830
-        ).get('precipitation_rate')
-        
-        return ee.Feature(None, {
-            'time': image.date().format(),
-            'precipitation_rate_kg_m2_s': precip 
-        })
-
-    try:
-        forecast_data = full_forecast_collection.map(get_value_at_point).getInfo()
-    except ee.ee_exception.EEException as e:
-         raise HTTPException(status_code=500, detail=f"Loi GEE khi lay du lieu du bao: {e}")
-    
-    results = []
-    for f in forecast_data['features']:
-        props = f['properties']
-        
-        if props['precipitation_rate_kg_m2_s'] is not None:
-            # (kg/m^2/s) * 10800s (3 gio) = kg/m^2 (tuong duong mm)
-            precip_mm = float(props['precipitation_rate_kg_m2_s']) * 10800
-            results.append({
-                "time": props['time'],
-                "precipitation_mm_3hr": precip_mm
-            })
-    return results
+# GFS retrieval code removed — forecasts are not used anymore. Kept removed
+# version out of the repo history; functionality replaced by 'no_rain_forecast'
 
 @app.post("/forecast")
 def get_precipitation_forecast(point_data: PointData):
+    """
+    Endpoint trả về:
+    1. Dự báo lượng mưa 7 ngày tới (3h một lần)
+    2. Dự báo nguy cơ ngập cho 7 ngày tới (mỗi ngày 1 dự báo)
+    """
     try:
-        forecast = get_gfs_forecast_at_point(point_data.lat, point_data.lon)
-        return {"forecast": forecast}
+        # New behaviour: do not use external rainfall forecasts (GFS).
+        # Instead, return a 7-day flood probability forecast using current
+        # features only (no assumed additional rainfall).
+        current_features = get_gee_features_at_point(point_data.lat, point_data.lon)
+
+        # Ensure dataframe has required columns in the correct order
+        df_current = pd.DataFrame([current_features], columns=FEATURES_ORDER)
+        if df_current.isnull().values.any():
+            df_current = df_current.fillna(0)
+
+        # Prepare 7-day forecasts: using the same features (no rainfall forecast)
+        forecasts = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        base_precip = float(current_features.get('precip_total', 0) or 0)
+
+        for day_offset in range(7):
+            date_key = (now + datetime.timedelta(days=day_offset)).date().isoformat()
+
+            # Copy features and set precip_total to base_precip (no change)
+            features = current_features.copy()
+            features['precip_total'] = base_precip
+
+            df = pd.DataFrame([features], columns=FEATURES_ORDER)
+            if df.isnull().values.any():
+                df = df.fillna(0)
+
+            scaled = scaler.transform(df)
+            probability = float(model.predict_proba(scaled)[0][1])
+
+            forecasts.append({
+                'date': date_key,
+                'precipitation_mm_24hr': None,
+                'flood_probability': probability
+            })
+
+        return {
+            'forecast': forecasts,
+            'rain_forecast_used': False,
+            'detail': {
+                'method': 'no_rain_forecast',
+                'note': 'Flood probability computed using current features only; no rainfall forecast used.',
+                'current_features': current_features
+            }
+        }
+    
     except ee.ee_exception.EEException as e:
         raise HTTPException(status_code=500, detail=f"Loi GEE: {e}")
     except HTTPException as e:
-        # Day la loi 404 hoac 500 ma chung ta da nem ra
         raise e
     except Exception as e:
         print(f"Loi Python/FastAPI trong /forecast: {e}")

@@ -10,25 +10,25 @@
 0    1050
 1      98
     
-    Do chinh xac tong a (Accuracy): 0.8563
+    Do chinh xac tong a (Accuracy): 0.8815
     
     Ma tran nham lan (Confusion Matrix):
-    [[954  96]
- [ 69  29]]
+    [[985  65]
+ [ 71  27]]
     
     Chi tiet (Precision, Recall, F1-Score):
                   precision    recall  f1-score   support
 
- 0_KhongNgap       0.93      0.91      0.92      1050
-      1_Ngap       0.23      0.30      0.26        98
+ 0_KhongNgap       0.93      0.94      0.94      1050
+      1_Ngap       0.29      0.28      0.28        98
 
-    accuracy                           0.86      1148
-   macro avg       0.58      0.60      0.59      1148
-weighted avg       0.87      0.86      0.86      1148
+    accuracy                           0.88      1148
+   macro avg       0.61      0.61      0.61      1148
+weighted avg       0.88      0.88      0.88      1148
 
     
     Cac tham so da su dung:
-    {'learning_rate': 0.1295621974624432, 'max_depth': 7, 'subsample': 0.923859227899872, 'colsample_bytree': 0.9150229387522917, 'gamma': 2.236414542203894, 'reg_alpha': 3.0495688656245314, 'reg_lambda': 3.043498097916669, 'objective': 'binary:logistic', 'eval_metric': 'logloss', 'n_estimators': 1000, 'random_state': 42, 'n_jobs': -1, 'early_stopping_rounds': 50}
+    {'learning_rate': 0.06057487405835294, 'max_depth': 9, 'subsample': 0.7590660542352695, 'colsample_bytree': 0.866358588514537, 'gamma': 4.084226905486547, 'reg_alpha': 1.6330668306780383, 'reg_lambda': 3.7172193345310327, 'objective': 'binary:logistic', 'eval_metric': 'logloss', 'n_estimators': 1000, 'random_state': 42, 'n_jobs': -1, 'early_stopping_rounds': 50}
     
     ==================================================================
     

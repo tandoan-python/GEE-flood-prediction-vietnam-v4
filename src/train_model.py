@@ -67,9 +67,38 @@ def main():
 
     print(f"Da doc thanh cong {len(df)} dong du lieu tu {DATA_PATH}")
 
-    features = [col for col in df.columns if col not in [
-        'flood', 'event_id', 'purpose', 'apex_date', 'detail', 's1_diff', '.geo', 'system:index'
-    ]]
+    # Định nghĩa các nhóm đặc trưng
+    static_features = [
+        'elevation', 'slope', 'aspect',          # Địa hình
+        'land_cover', 'soil_type',               # Lớp phủ và đất
+        'is_flood_prone', 'is_permanent_water',  # Flags từ land_cover
+        'is_urban', 'is_agriculture'             # Flags từ land_cover
+    ]
+    
+    dynamic_features = [
+        'precip_total', 'precip_14_day',        # Lượng mưa
+        'precip_7_day', 'precip_3_day',
+        'soil_moisture'                          # Độ ẩm đất
+    ]
+    
+    # Loại bỏ các cột không phải đặc trưng
+    excluded_columns = [
+        'flood',            # nhãn
+        'event_id',         # metadata
+        'purpose',          # phân chia tập
+        'apex_date',        # thời gian
+        'detail',          # mô tả
+        's1_diff',         # đặc trưng thô
+        '.geo',            # geometry
+        'system:index',    # index
+        'coordinates',     # đã xử lý từ .geo
+        'latitude',        # đã xử lý từ .geo
+        'longitude',       # đã xử lý từ .geo
+        'land_cover_name'  # tên tiếng Việt
+    ]
+    
+    # Kết hợp tất cả đặc trưng
+    features = static_features + dynamic_features
     
     if not features:
         print("Loi: Khong tim thay dac trung nao de huan luyen.")

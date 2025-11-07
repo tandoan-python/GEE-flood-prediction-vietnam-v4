@@ -5,6 +5,9 @@ import sys
 
 # =============================================================================
 # KHỞI TẠO VÀ CẤU HÌNH GEE
+# Phần mày phải đăng kí 1 tài khoản GEE và xác thực trước khi chạy.
+# Bạn có thể làm theo hướng dẫn tại: https://developers.google.com/earth-engine/getstarted
+# Sau khi xác thực, bạn có thể chạy script này.
 # =============================================================================
 try:
     ee.Initialize(opt_url='https://earthengine-highvolume.googleapis.com')
@@ -14,7 +17,7 @@ except ee.ee_exception.EEException:
 print("Khoi tao GEE thanh cong.")
 
 # =============================================================================
-# DANH SÁCH SỰ KIỆN LŨ LỤT (Giu nguyen)
+# DANH SÁCH SỰ KIỆN LŨ LỤT (15 sự kiện lịch sử)
 # =============================================================================
 FLOOD_EVENTS = [
     {
@@ -89,15 +92,38 @@ AOI = ee.FeatureCollection("FAO/GAUL/2015/level0").filter(ee.Filter.eq('ADM0_NAM
 # =============================================================================
 # CÁC ĐẶC TRƯNG TĨNH (STATIC FEATURES) - DA DON GIAN HOA
 # =============================================================================
+"""
+    Tạo một ảnh (ee.Image) chứa các đặc trưng tĩnh (không thay đổi theo thời gian) dùng cho mô hình
+    
+    Các tham số truyền vào hàm bao gồm:
+    1. aoi (vùng quan tâm): Geometry của vùng cần phân tích (Việt Nam)
+    2. dem (Digital Elevation Model): Đã giải thích trong hàm create_export_task
+    3. slope (độ dốc): tính từ DEM, Đã giải thích trong hàm create_export_task
+    
+    Các đặc trưng tĩnh bao gồm:
+    
+    1. aspect (hướng sườn): tính từ DEM
+    2. land_cover (bản đồ lớp phủ đất): sử dụng ESA WorldCover
+    3. soil_type (loại đất): sử dụng OpenLandMap Soil Texture
+    
+    4. slope: biến truyền vào
+    5. elevation (cao độ): biến truyền vào (DEM)
+    
+    Ảnh trả về được reproject về cùng hệ tọa độ của DEM với scale = 90 m.
+
+"""
 def get_static_features(aoi, dem, slope):
     """
     Dinh nghia cac dac trung tinh.
     LUU Y: DEM va Slope duoc truyen vao de tai su dung.
     """
-    # 1. DEM, Slope, Aspect (Tai su dung tu ham chinh)
+    # 1. Aspect: Hướng sườn
     aspect = ee.Terrain.aspect(dem).rename('aspect')
 
     # 2. Land Cover
+    # bản đồ lớp phủ đất thế giới (WorldCover v1.0), 
+    # Band 'Map' mã hóa các lớp, tính bằng số nguyên thể hiện type: rừng, nước, built-up, cropland, v.v.).
+    # Dùng để phân biệt vùng nước, đô thị, rừng, nông nghiệp… giúp mô hình phân biệt khả năng ngập.
     land_cover = ee.ImageCollection("ESA/WorldCover/v100").first() \
                    .select('Map') \
                    .clip(aoi).rename('land_cover')
@@ -107,18 +133,29 @@ def get_static_features(aoi, dem, slope):
              .select('b0') \
              .clip(aoi).rename('soil_type')
 
-    # Gop cac dac trung nhe
+    # Tao cac flags huu ich tu land cover
+    is_flood_prone = land_cover.eq(40).Or(land_cover.eq(50)).Or(land_cover.eq(90)).rename('is_flood_prone')
+    is_permanent_water = land_cover.eq(80).rename('is_permanent_water')
+    is_urban = land_cover.eq(50).rename('is_urban')
+    is_agriculture = land_cover.eq(40).rename('is_agriculture')
+    
+    # Gop cac dac trung
     static_features_image = dem.rename('elevation').addBands([
         slope,
         aspect,
         land_cover.toByte(),
-        soil.toByte()
+        soil.toByte(),
+        # Them cac flags
+        is_flood_prone.toByte(),
+        is_permanent_water.toByte(),
+        is_urban.toByte(),
+        is_agriculture.toByte()
     ])
 
     # Chuan hoa scale (rat quan trong)
     static_features_image = static_features_image.reproject(
         crs=dem.projection().crs(),
-        scale=90
+        scale=30
     )
     
     return static_features_image
@@ -187,7 +224,6 @@ def get_flood_data(s1_baseline, s1_during, slope, features_to_add):
     diff = s1_baseline.subtract(s1_during).rename('s1_diff')
     
     # === THAY DOI QUAN TRONG ===
-    # Nguong cu: diff.gt(5) -> QUA GAT, lay duoc qua it diem (chi 552 diem)
     # Nguong moi: diff.gt(2.5) -> Noi long de "nhay" hon voi lu nong/vua
     flood_map = diff.gt(2.5)
     
@@ -247,7 +283,12 @@ def create_export_task(aoi, event_dict, num_points=3000, scale=90):
                         .select('VH').mean().clip(aoi)
         
         # 1.3. Tinh DEM va Slope (chi 1 lan)
+        # dem (Digital Elevation Model): Cao độ mặt đất so với mực nước biển, đơn vị là mét.
         dem = ee.Image("USGS/SRTMGL1_003").clip(aoi)
+        
+        # slope (độ dốc): Độ nghiêng của bề mặt đất, tính từ DEM.
+        # Đơn vị là độ (0-90).
+        # ee.Terrain.slope() sẽ trả về độ dốc theo đơn vị độ.
         slope = ee.Terrain.slope(dem).rename('slope')
 
         # 1.4. Goi cac ham dac trung
